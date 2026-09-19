@@ -4,8 +4,8 @@ compatibility_date = "2024-12-30"
 workers_dev = true
 
 [vars]
-GITHUB_APP_ID = "replace-with-your-app-id"
-ALLOWED_GITHUB_ACCOUNT_IDS = "replace-with-your-github-account-id"
+GITHUB_APP_ID = "5002033"
+ALLOWED_GITHUB_ACCOUNT_IDS = "3876350"
 
 [[d1_databases]]
 binding = "DB"
