@@ -1,0 +1,17 @@
+name = "issue-pilot-test"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+DESKTOP_API_TOKEN = "test-desktop-token"
+WEBHOOK_SECRET = "test-webhook-secret"
+GITHUB_APP_ID = "1"
+GITHUB_APP_PRIVATE_KEY = "unused-in-tests"
+ALLOWED_GITHUB_ACCOUNT_IDS = "1"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "issue-pilot-test"
+database_id = "test"
+migrations_dir = "migrations"

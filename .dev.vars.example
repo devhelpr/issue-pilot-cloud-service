@@ -1,0 +1,4 @@
+# Never commit .dev.vars. Generate a long random DESKTOP_API_TOKEN.
+WEBHOOK_SECRET=replace-me
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\nreplace-me\n-----END RSA PRIVATE KEY-----"
+DESKTOP_API_TOKEN=replace-me-with-a-long-random-token

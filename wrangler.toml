@@ -1,0 +1,17 @@
+name = "issue-pilot-cloud-service"
+main = "src/index.ts"
+compatibility_date = "2024-12-30"
+workers_dev = true
+
+[vars]
+GITHUB_APP_ID = "replace-with-your-app-id"
+ALLOWED_GITHUB_ACCOUNT_IDS = "replace-with-your-github-account-id"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "issue-pilot"
+database_id = "45346a4b-6fe5-4ac9-86de-2d2082693f04"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["* * * * *"]
