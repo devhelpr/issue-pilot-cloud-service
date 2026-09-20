@@ -4,12 +4,22 @@ import { allowedAccount } from './security';
 import type { Env } from './types';
 
 type Repository = { id: number; github_id: string; installation_id: string; owner: string; name: string; active: number; sync_cursor: number; sync_updated_after: string | null };
+type Installation = { id: number; account: { id: number; login: string }; suspended_at: string | null };
+
+// GitHub returns { installations, total_count } for this endpoint (not a bare array).
+function installationPage(payload: unknown): Installation[] {
+  if (Array.isArray(payload)) return payload as Installation[];
+  if (payload && typeof payload === 'object' && Array.isArray((payload as { installations?: unknown }).installations)) {
+    return (payload as { installations: Installation[] }).installations;
+  }
+  throw new Error('GitHub installations response had an unexpected shape');
+}
 
 export async function refreshRepositories(env: Env): Promise<number> {
   for (let page = 1; ; page++) {
     const response = await githubAppFetch(env, `/app/installations?per_page=100&page=${page}`);
     if (!response.ok) throw await githubApiError(response);
-    const discovered = await response.json() as Array<{ id: number; account: { id: number; login: string }; suspended_at: string | null }>;
+    const discovered = installationPage(await response.json());
     for (const installation of discovered) {
       if (!allowedAccount(env, String(installation.account.id)) || installation.suspended_at) continue;
       await env.DB.prepare(`INSERT INTO github_installations (github_id, account_id, account_login, status)
