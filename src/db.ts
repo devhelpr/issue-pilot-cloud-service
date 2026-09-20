@@ -8,15 +8,21 @@ export async function event(db: D1Database, jobId: string, eventType: string, de
 }
 
 export async function upsertIssue(db: D1Database, repoId: number, issue: any): Promise<void> {
-  if (issue.pull_request) return;
+  const statement = issueUpsert(db, repoId, issue);
+  if (statement) await statement.run();
+}
+
+/** A version-guarded issue write, usable in a D1 batch with related job changes. */
+export function issueUpsert(db: D1Database, repoId: number, issue: any): D1PreparedStatement | undefined {
+  if (issue.pull_request) return undefined;
   const version = issue.updated_at;
   const labels = JSON.stringify((issue.labels ?? []).map((label: any) => typeof label === 'string' ? label : label.name));
-  await db.prepare(`INSERT INTO issues (github_id, repository_id, number, title, body, html_url, labels_json, state, github_updated_at, version)
+  return db.prepare(`INSERT INTO issues (github_id, repository_id, number, title, body, html_url, labels_json, state, github_updated_at, version)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(github_id) DO UPDATE SET title=excluded.title, body=excluded.body, html_url=excluded.html_url,
       labels_json=excluded.labels_json, state=excluded.state, github_updated_at=excluded.github_updated_at, version=excluded.version, updated_at=CURRENT_TIMESTAMP
     WHERE excluded.github_updated_at >= issues.github_updated_at`)
-    .bind(String(issue.id), repoId, issue.number, issue.title, issue.body ?? null, issue.html_url, labels, issue.state, issue.updated_at, version).run();
+    .bind(String(issue.id), repoId, issue.number, issue.title, issue.body ?? null, issue.html_url, labels, issue.state, issue.updated_at, version);
 }
 
 export async function cancelQueuedJobs(db: D1Database, issueId: number, reason: string): Promise<void> {

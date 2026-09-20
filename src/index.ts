@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { cancelQueuedJobs, event, id, upsertIssue } from './db';
+import { event, id, issueUpsert } from './db';
 import { allowedAccount, isAuthorized, verifyWebhook } from './security';
 import { openapi } from './openapi';
 import { refreshRepositories, runScheduledSync, syncRepository } from './sync';
@@ -10,6 +10,17 @@ const app = new Hono<{ Bindings: Env }>();
 const jsonError = (code: string, message: string, requestId: string, status = 400) => new Response(JSON.stringify({ code, message, request_id: requestId }), { status, headers: { 'content-type': 'application/json', 'x-request-id': requestId } });
 const requestId = () => crypto.randomUUID();
 const page = (value: string | undefined) => Math.min(Math.max(Number(value ?? 50) || 50, 1), 100);
+type Cursor = { key: string; id: number | string };
+const encodeCursor = (value: Cursor) => btoa(JSON.stringify(value)).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+const decodeCursor = (raw: string | undefined): Cursor | undefined => {
+  if (!raw) return undefined;
+  try {
+    const padded = raw.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - raw.length % 4) % 4);
+    const value = JSON.parse(atob(padded));
+    if (typeof value?.key !== 'string' || (typeof value.id !== 'string' && typeof value.id !== 'number')) throw new Error('invalid');
+    return value;
+  } catch { throw new z.ZodError([{ code: 'custom', path: ['cursor'], message: 'Invalid cursor' }]); }
+};
 
 app.use('/v1/*', async (c, next) => {
   if (!isAuthorized(c.req.raw, c.env)) return jsonError('unauthorized', 'Missing or invalid bearer token', requestId(), 401);
@@ -47,28 +58,39 @@ app.post('/github/webhook', async (c) => {
 });
 
 app.post('/v1/github/sync', async (c) => c.json({ repositories: await refreshRepositories(c.env) }));
-app.get('/v1/repositories', async (c) => c.json({ items: (await c.env.DB.prepare('SELECT * FROM repositories ORDER BY full_name LIMIT ?').bind(page(c.req.query('limit'))).all()).results }));
+app.get('/v1/repositories', async (c) => {
+  const limit = page(c.req.query('limit')); const cursor = decodeCursor(c.req.query('cursor'));
+  const rows = await c.env.DB.prepare(`SELECT * FROM repositories ${cursor ? 'WHERE (full_name > ? OR (full_name = ? AND id > ?))' : ''} ORDER BY full_name, id LIMIT ?`)
+    .bind(...(cursor ? [cursor.key, cursor.key, cursor.id, limit + 1] : [limit + 1])).all<any>();
+  const items = rows.results.slice(0, limit); const last = items.at(-1);
+  return c.json({ items, next_cursor: rows.results.length > limit && last ? encodeCursor({ key: last.full_name, id: last.id }) : null });
+});
 app.patch('/v1/repositories/:id', async (c) => {
   const body = z.object({ active: z.boolean() }).parse(await c.req.json());
   const repo = await c.env.DB.prepare('SELECT * FROM repositories WHERE id=?').bind(c.req.param('id')).first<any>();
   if (!repo) return jsonError('not_found', 'Repository not found', requestId(), 404);
   if (body.active && repo.access_status !== 'active') return jsonError('access_revoked', 'Repository access was revoked', requestId(), 409);
-  await c.env.DB.prepare('UPDATE repositories SET active=?, sync_requested_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE sync_requested_at END, sync_cursor=CASE WHEN ? THEN 1 ELSE sync_cursor END, updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(body.active ? 1 : 0, body.active ? 1 : 0, body.active ? 1 : 0, repo.id).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE repositories SET active=?, sync_requested_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE sync_requested_at END, sync_cursor=CASE WHEN ? THEN 1 ELSE sync_cursor END, sync_status=CASE WHEN ? THEN 'queued' ELSE sync_status END, sync_error=CASE WHEN ? THEN NULL ELSE sync_error END, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(body.active ? 1 : 0, body.active ? 1 : 0, body.active ? 1 : 0, body.active ? 1 : 0, body.active ? 1 : 0, repo.id),
+    ...(body.active ? [] : [c.env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repo.id)])
+  ]);
   return c.json({ id: repo.id, active: body.active });
 });
 app.post('/v1/repositories/:id/sync', async (c) => {
   const repo = await c.env.DB.prepare('SELECT * FROM repositories WHERE id=?').bind(c.req.param('id')).first<any>();
   if (!repo) return jsonError('not_found', 'Repository not found', requestId(), 404);
-  await c.env.DB.prepare("UPDATE repositories SET sync_requested_at=CURRENT_TIMESTAMP, sync_cursor=1, sync_updated_after=NULL WHERE id=?").bind(repo.id).run();
+  await c.env.DB.prepare("UPDATE repositories SET sync_requested_at=CURRENT_TIMESTAMP, sync_cursor=1, sync_updated_after=NULL, sync_status='queued', sync_error=NULL WHERE id=?").bind(repo.id).run();
   return c.json({ requested: true }, 202);
 });
 app.get('/v1/issues', async (c) => {
   const status = c.req.query('state'); const repo = c.req.query('repository_id'); const limit = page(c.req.query('limit'));
-  const clauses = ['1=1']; const values: unknown[] = [];
+  const clauses = ['1=1']; const values: unknown[] = []; const cursor = decodeCursor(c.req.query('cursor'));
   if (status) { clauses.push('i.state=?'); values.push(status); } if (repo) { clauses.push('i.repository_id=?'); values.push(repo); }
-  values.push(limit);
-  const result = await c.env.DB.prepare(`SELECT i.*, r.full_name, r.active FROM issues i JOIN repositories r ON r.id=i.repository_id WHERE ${clauses.join(' AND ')} ORDER BY i.github_updated_at DESC LIMIT ?`).bind(...values).all();
-  return c.json({ items: result.results });
+  if (cursor) { clauses.push('(i.github_updated_at < ? OR (i.github_updated_at = ? AND i.id < ?))'); values.push(cursor.key, cursor.key, cursor.id); }
+  values.push(limit + 1);
+  const result = await c.env.DB.prepare(`SELECT i.*, r.full_name, r.active FROM issues i JOIN repositories r ON r.id=i.repository_id WHERE ${clauses.join(' AND ')} ORDER BY i.github_updated_at DESC, i.id DESC LIMIT ?`).bind(...values).all<any>();
+  const items = result.results.slice(0, limit); const last = items.at(-1);
+  return c.json({ items, next_cursor: result.results.length > limit && last ? encodeCursor({ key: last.github_updated_at, id: last.id }) : null });
 });
 app.post('/v1/issues/:id/approve', async (c) => {
   const body = z.object({ version: z.string() }).parse(await c.req.json()); const key = c.req.header('Idempotency-Key');
@@ -83,7 +105,7 @@ app.post('/v1/issues/:id/approve', async (c) => {
   catch { return jsonError('active_job_exists', 'An active job already exists for this issue', requestId(), 409); }
   return c.json({ id: jobId, status: 'queued' }, 201);
 });
-app.get('/v1/jobs', async (c) => { const status = c.req.query('status'); const result = await c.env.DB.prepare(`SELECT * FROM jobs ${status ? 'WHERE status=?' : ''} ORDER BY created_at DESC LIMIT ?`).bind(...(status ? [status, page(c.req.query('limit'))] : [page(c.req.query('limit'))])).all(); return c.json({ items: result.results }); });
+app.get('/v1/jobs', async (c) => { const status = c.req.query('status'); const limit = page(c.req.query('limit')); const cursor = decodeCursor(c.req.query('cursor')); const clauses: string[] = []; const values: unknown[] = []; if (status) { clauses.push('status=?'); values.push(status); } if (cursor) { clauses.push('(created_at < ? OR (created_at = ? AND id < ?))'); values.push(cursor.key, cursor.key, cursor.id); } values.push(limit + 1); const result = await c.env.DB.prepare(`SELECT * FROM jobs ${clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''} ORDER BY created_at DESC, id DESC LIMIT ?`).bind(...values).all<any>(); const items = result.results.slice(0, limit); const last = items.at(-1); return c.json({ items, next_cursor: result.results.length > limit && last ? encodeCursor({ key: last.created_at, id: last.id }) : null }); });
 app.get('/v1/jobs/:id', async (c) => { const job = await c.env.DB.prepare('SELECT * FROM jobs WHERE id=?').bind(c.req.param('id')).first(); if (!job) return jsonError('not_found', 'Job not found', requestId(), 404); const events = await c.env.DB.prepare('SELECT * FROM job_events WHERE job_id=? ORDER BY id').bind(c.req.param('id')).all(); return c.json({ ...job as object, events: events.results }); });
 app.post('/v1/jobs/:id/claim', async (c) => {
   const body = z.object({ client_id: z.string().min(1), claim_id: z.string().uuid() }).parse(await c.req.json()); const jobId = c.req.param('id');
@@ -92,26 +114,54 @@ app.post('/v1/jobs/:id/claim', async (c) => {
   if (!result.meta.changes) return jsonError('claim_conflict', 'Job is not available', requestId(), 409); await event(c.env.DB, jobId, 'claimed', body); return c.json({ id: jobId, status: 'running', claim_id: body.claim_id });
 });
 app.post('/v1/jobs/:id/heartbeat', async (c) => {
-  const body = z.object({ claim_id: z.string().uuid() }).parse(await c.req.json()); const result = await c.env.DB.prepare("UPDATE jobs SET heartbeat_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='running' AND claim_id=?").bind(c.req.param('id'), body.claim_id).run(); if (!result.meta.changes) return jsonError('stale_claim', 'Claim is no longer active', requestId(), 409); const job = await c.env.DB.prepare('SELECT stop_requested FROM jobs WHERE id=?').bind(c.req.param('id')).first(); return c.json({ ok: true, stop_requested: Boolean((job as any)?.stop_requested) });
+  const body = z.object({ claim_id: z.string().uuid() }).parse(await c.req.json()); const job = await c.env.DB.prepare("SELECT j.stop_requested, r.active, r.access_status, i.state FROM jobs j JOIN issues i ON i.id=j.issue_id JOIN repositories r ON r.id=i.repository_id WHERE j.id=? AND j.status='running' AND j.claim_id=?").bind(c.req.param('id'), body.claim_id).first<any>(); if (!job) return jsonError('stale_claim', 'Claim is no longer active', requestId(), 409); const stopRequested = Boolean(job.stop_requested) || !job.active || job.access_status !== 'active' || job.state !== 'open'; if (stopRequested) return c.json({ ok: false, stop_requested: true }); await c.env.DB.prepare('UPDATE jobs SET heartbeat_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(c.req.param('id')).run(); return c.json({ ok: true, stop_requested: false });
 });
 app.post('/v1/jobs/:id/status', async (c) => {
   const body = z.object({ claim_id: z.string().uuid(), phase: z.enum(['analyzing','fixing','testing','creating_pr']).optional(), status: z.enum(['succeeded','failed']).optional(), summary: z.string().max(4000).optional(), commit_sha: z.string().optional(), pr_url: z.string().url().optional() }).parse(await c.req.json());
-  const job = await c.env.DB.prepare("SELECT * FROM jobs WHERE id=? AND claim_id=? AND status='running'").bind(c.req.param('id'), body.claim_id).first<any>(); if (!job) return jsonError('stale_claim', 'Claim is no longer active', requestId(), 409);
-  const newStatus: JobStatus = body.status ?? 'running'; await c.env.DB.prepare('UPDATE jobs SET status=?, phase=?, result_summary=COALESCE(?,result_summary), commit_sha=COALESCE(?,commit_sha), pr_url=COALESCE(?,pr_url), heartbeat_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(newStatus, body.phase ?? job.phase, body.summary ?? null, body.commit_sha ?? null, body.pr_url ?? null, job.id).run(); await event(c.env.DB, job.id, newStatus === 'running' ? 'progress' : newStatus, body); return c.json({ id: job.id, status: newStatus });
+  const job = await c.env.DB.prepare('SELECT j.*, r.active, r.access_status, i.state FROM jobs j JOIN issues i ON i.id=j.issue_id JOIN repositories r ON r.id=i.repository_id WHERE j.id=? AND j.claim_id=?').bind(c.req.param('id'), body.claim_id).first<any>();
+  if (!job) return jsonError('stale_claim', 'Claim is no longer active', requestId(), 409);
+  const newStatus: JobStatus = body.status ?? 'running';
+  // A response lost after the external write can be resent after the job has become terminal.
+  if (job.status !== 'running') {
+    const identicalTerminal = body.status && job.status === body.status && (job.commit_sha ?? null) === (body.commit_sha ?? null) && (job.pr_url ?? null) === (body.pr_url ?? null);
+    if (!identicalTerminal) return jsonError('stale_claim', 'Claim is no longer active', requestId(), 409);
+    return c.json({ id: job.id, status: job.status, commit_sha: job.commit_sha, pr_url: job.pr_url, reconciliation: 'stored' });
+  }
+  const externalWrite = body.phase === 'creating_pr' || Boolean(body.commit_sha) || Boolean(body.pr_url) || body.status === 'succeeded';
+  if (externalWrite && (job.stop_requested || !job.active || job.access_status !== 'active' || job.state !== 'open')) return jsonError('stop_requested', 'Repository access or issue state no longer permits external writes', requestId(), 409);
+  await c.env.DB.prepare('UPDATE jobs SET status=?, phase=?, result_summary=COALESCE(?,result_summary), commit_sha=COALESCE(?,commit_sha), pr_url=COALESCE(?,pr_url), heartbeat_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE id=?').bind(newStatus, body.phase ?? job.phase, body.summary ?? null, body.commit_sha ?? null, body.pr_url ?? null, job.id).run(); await event(c.env.DB, job.id, newStatus === 'running' ? 'progress' : newStatus, body); return c.json({ id: job.id, status: newStatus, commit_sha: body.commit_sha ?? job.commit_sha, pr_url: body.pr_url ?? job.pr_url, reconciliation: 'updated' });
 });
-app.post('/v1/jobs/:id/retry', async (c) => { const old = await c.env.DB.prepare("SELECT * FROM jobs WHERE id=? AND status IN ('interrupted','failed','cancelled')").bind(c.req.param('id')).first<any>(); if (!old) return jsonError('not_retryable', 'Job is not retryable', requestId(), 409); const jobId = id(); await c.env.DB.batch([c.env.DB.prepare('INSERT INTO jobs (id, issue_id, attempt, issue_version, issue_title, issue_body, status) VALUES (?, ?, ?, ?, ?, ?, \'queued\')').bind(jobId, old.issue_id, old.attempt + 1, old.issue_version, old.issue_title, old.issue_body), c.env.DB.prepare('INSERT INTO job_events (job_id,event_type,detail_json) VALUES (?,\'retried\',?)').bind(jobId, JSON.stringify({ from: old.id }))]); return c.json({ id: jobId, status: 'queued' }, 201); });
+app.get('/v1/jobs/:id/claim', async (c) => { const claimId = z.string().uuid().parse(c.req.query('claim_id')); const job = await c.env.DB.prepare('SELECT j.status, j.claim_id, j.stop_requested, r.active, r.access_status, i.state FROM jobs j JOIN issues i ON i.id=j.issue_id JOIN repositories r ON r.id=i.repository_id WHERE j.id=?').bind(c.req.param('id')).first<any>(); if (!job) return jsonError('not_found', 'Job not found', requestId(), 404); const repositoryActive = Boolean(job.active) && job.access_status === 'active'; const valid = job.status === 'running' && job.claim_id === claimId && !job.stop_requested && repositoryActive && job.state === 'open'; return c.json({ valid, stop_requested: Boolean(job.stop_requested), repository_active: repositoryActive, issue_state: job.state }); });
+app.post('/v1/jobs/:id/retry', async (c) => { const old = await c.env.DB.prepare("SELECT j.*, i.version AS current_version, i.state AS issue_state, r.active, r.access_status FROM jobs j JOIN issues i ON i.id=j.issue_id JOIN repositories r ON r.id=i.repository_id WHERE j.id=? AND j.status IN ('interrupted','failed','cancelled')").bind(c.req.param('id')).first<any>(); if (!old) return jsonError('not_retryable', 'Job is not retryable', requestId(), 409); if (old.issue_version !== old.current_version || old.issue_state !== 'open' || !old.active || old.access_status !== 'active') return jsonError('issue_changed', 'Issue changed, closed, or is no longer accessible', requestId(), 409); const jobId = id(); await c.env.DB.batch([c.env.DB.prepare('INSERT INTO jobs (id, issue_id, attempt, issue_version, issue_title, issue_body, status) VALUES (?, ?, ?, ?, ?, ?, \'queued\')').bind(jobId, old.issue_id, old.attempt + 1, old.issue_version, old.issue_title, old.issue_body), c.env.DB.prepare('INSERT INTO job_events (job_id,event_type,detail_json) VALUES (?,\'retried\',?)').bind(jobId, JSON.stringify({ from: old.id }))]); return c.json({ id: jobId, status: 'queued' }, 201); });
 
 async function handleInstallation(env: Env, payload: any): Promise<void> {
   const installation = payload.installation; if (!installation) return; const accountId = String(installation.account.id);
   if (!allowedAccount(env, accountId)) return;
   const status = ['deleted', 'suspend'].includes(payload.action) ? (payload.action === 'deleted' ? 'deleted' : 'suspended') : 'active';
   await env.DB.prepare('INSERT INTO github_installations (github_id,account_id,account_login,status) VALUES (?,?,?,?) ON CONFLICT(github_id) DO UPDATE SET status=excluded.status, account_login=excluded.account_login, updated_at=CURRENT_TIMESTAMP').bind(String(installation.id), accountId, installation.account.login, status).run();
-  if (status !== 'active') await env.DB.prepare("UPDATE repositories SET active=0, access_status='revoked' WHERE installation_id=?").bind(String(installation.id)).run();
+  if (status !== 'active') {
+    const repositories = await env.DB.prepare('SELECT id FROM repositories WHERE installation_id=?').bind(String(installation.id)).all<{ id: number }>();
+    await env.DB.batch([env.DB.prepare("UPDATE repositories SET active=0, access_status='revoked', updated_at=CURRENT_TIMESTAMP WHERE installation_id=?").bind(String(installation.id)), ...repositories.results.map((repo) => env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repo.id))]);
+  }
+  const removed = payload.repositories_removed ?? (payload.action === 'removed' && payload.repository ? [payload.repository] : []);
+  if (status === 'active' && removed.length) {
+    const githubIds = removed.map((repo: any) => String(repo.id));
+    const placeholders = githubIds.map(() => '?').join(',');
+    const repositories = await env.DB.prepare(`SELECT id FROM repositories WHERE installation_id=? AND github_id IN (${placeholders})`).bind(String(installation.id), ...githubIds).all<{ id: number }>();
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE repositories SET active=0, access_status='revoked', updated_at=CURRENT_TIMESTAMP WHERE installation_id=? AND github_id IN (${placeholders})`).bind(String(installation.id), ...githubIds),
+      ...repositories.results.map((repo) => env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repo.id))
+    ]);
+  }
 }
 async function handleIssue(env: Env, payload: any): Promise<void> {
   if (payload.issue?.pull_request) return; const repo = await env.DB.prepare('SELECT * FROM repositories WHERE github_id=?').bind(String(payload.repository.id)).first<any>(); if (!repo || !repo.active || repo.access_status !== 'active') return;
-  await upsertIssue(env.DB, repo.id, payload.issue); const issue = await env.DB.prepare('SELECT id FROM issues WHERE github_id=?').bind(String(payload.issue.id)).first<any>();
-  if (payload.issue.state === 'closed' && issue) await cancelQueuedJobs(env.DB, issue.id, 'issue_closed');
+  const upsert = issueUpsert(env.DB, repo.id, payload.issue); if (!upsert) return;
+  // Keep the issue version write and revocation of runnable work in one D1 transaction.
+  await env.DB.batch([upsert, ...(payload.issue.state === 'closed' ? [
+    env.DB.prepare("UPDATE jobs SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE status='queued' AND issue_id IN (SELECT id FROM issues WHERE github_id=? AND state='closed' AND version=?)").bind(String(payload.issue.id), payload.issue.updated_at),
+    env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE github_id=? AND state='closed' AND version=?)").bind(String(payload.issue.id), payload.issue.updated_at)
+  ] : [])]);
 }
 
 export default { fetch: app.fetch, scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => ctx.waitUntil(runScheduledSync(env)) } satisfies ExportedHandler<Env>;

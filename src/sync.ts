@@ -1,5 +1,5 @@
 import { githubAppFetch, githubFetch } from './github';
-import { cancelQueuedJobs, upsertIssue } from './db';
+import { issueUpsert } from './db';
 import { allowedAccount } from './security';
 import type { Env } from './types';
 
@@ -35,21 +35,28 @@ export async function refreshRepositories(env: Env): Promise<number> {
 }
 
 export async function syncRepository(env: Env, repository: Repository): Promise<{ done: boolean; imported: number }> {
+  await env.DB.prepare("UPDATE repositories SET sync_status='running', sync_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(repository.id).run();
   const params = new URLSearchParams({ state: 'all', sort: 'updated', direction: 'asc', per_page: '100', page: String(repository.sync_cursor) });
   if (repository.sync_updated_after) params.set('since', new Date(Date.parse(repository.sync_updated_after) - 60_000).toISOString());
   const response = await githubFetch(env, repository.installation_id, `/repos/${repository.owner}/${repository.name}/issues?${params}`);
   if (response.status === 403 || response.status === 404) {
-    await env.DB.prepare("UPDATE repositories SET access_status='revoked', active=0, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(repository.id).run();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE repositories SET access_status='revoked', active=0, sync_status='failed', sync_error='GitHub repository access was revoked', updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(repository.id),
+      env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repository.id)
+    ]);
     return { done: true, imported: 0 };
   }
   if (!response.ok) throw new Error(`GitHub issue sync failed (${response.status})`);
   const issues = await response.json() as any[];
-  for (const issue of issues) await upsertIssue(env.DB, repository.id, issue);
   const done = issues.length < 100;
   const latest = issues.at(-1)?.updated_at ?? repository.sync_updated_after;
-  await env.DB.prepare(`UPDATE repositories SET sync_cursor=?, sync_updated_after=?, last_synced_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE last_synced_at END,
-    sync_requested_at=CASE WHEN ? THEN NULL ELSE sync_requested_at END, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
-    .bind(done ? 1 : repository.sync_cursor + 1, latest, done ? 1 : 0, done ? 1 : 0, repository.id).run();
+  // The page checkpoint only advances in the same transaction as all its version-guarded issue writes.
+  await env.DB.batch([
+    ...issues.map((issue) => issueUpsert(env.DB, repository.id, issue)).filter((statement): statement is D1PreparedStatement => Boolean(statement)),
+    env.DB.prepare(`UPDATE repositories SET sync_cursor=?, sync_updated_after=?, last_synced_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE last_synced_at END,
+      sync_requested_at=CASE WHEN ? THEN NULL ELSE sync_requested_at END, sync_status=?, sync_error=NULL, updated_at=CURRENT_TIMESTAMP WHERE id=?`)
+      .bind(done ? 1 : repository.sync_cursor + 1, latest, done ? 1 : 0, done ? 1 : 0, done ? 'completed' : 'running', repository.id)
+  ]);
   return { done, imported: issues.filter((issue) => !issue.pull_request).length };
 }
 
@@ -58,6 +65,6 @@ export async function runScheduledSync(env: Env): Promise<void> {
   const repositories = await env.DB.prepare(`SELECT id, github_id, installation_id, owner, name, active, sync_cursor, sync_updated_after FROM repositories
     WHERE active=1 AND access_status='active' AND (sync_requested_at IS NOT NULL OR last_synced_at IS NULL OR last_synced_at < datetime('now', '-15 minutes')) LIMIT 5`).all<Repository>();
   for (const repository of repositories.results) {
-    try { await syncRepository(env, repository); } catch (error) { console.log(JSON.stringify({ code: 'sync_failed', repository_id: repository.id, message: error instanceof Error ? error.message : 'unknown' })); }
+    try { await syncRepository(env, repository); } catch (error) { const message = error instanceof Error ? error.message : 'unknown'; await env.DB.prepare("UPDATE repositories SET sync_status='failed', sync_error=?, updated_at=CURRENT_TIMESTAMP WHERE id=?").bind(message.slice(0, 1000), repository.id).run(); console.log(JSON.stringify({ code: 'sync_failed', repository_id: repository.id, message })); }
   }
 }
