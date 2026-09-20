@@ -2,6 +2,28 @@ import type { Env } from './types';
 
 const GITHUB_API = 'https://api.github.com';
 
+/** A GitHub REST error that can be safely returned by an API handler. */
+export class GitHubApiError extends Error {
+  constructor(
+    public readonly status: number,
+    public readonly body: string,
+    public readonly contentType: string | null,
+    public readonly githubRequestId: string | null
+  ) {
+    super(`GitHub API request failed (${status})`);
+    this.name = 'GitHubApiError';
+  }
+}
+
+export async function githubApiError(response: Response): Promise<GitHubApiError> {
+  return new GitHubApiError(
+    response.status,
+    await response.text(),
+    response.headers.get('content-type'),
+    response.headers.get('x-github-request-id')
+  );
+}
+
 function base64Url(bytes: Uint8Array): string {
   let binary = '';
   bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
@@ -27,7 +49,7 @@ export async function installationToken(env: Env, installationId: string): Promi
   const response = await fetch(`${GITHUB_API}/app/installations/${installationId}/access_tokens`, {
     method: 'POST', headers: { Authorization: `Bearer ${await appJwt(env)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'issue-pilot' }
   });
-  if (!response.ok) throw new Error(`GitHub installation token failed (${response.status})`);
+  if (!response.ok) throw await githubApiError(response);
   return (await response.json() as { token: string }).token;
 }
 

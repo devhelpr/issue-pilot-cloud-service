@@ -4,6 +4,7 @@ import { event, id, issueUpsert } from './db';
 import { allowedAccount, isAuthorized, verifyWebhook } from './security';
 import { openapi } from './openapi';
 import { refreshRepositories, runScheduledSync, syncRepository } from './sync';
+import { GitHubApiError } from './github';
 import type { Env, JobStatus } from './types';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -29,6 +30,11 @@ app.use('/v1/*', async (c, next) => {
 app.onError((error, c) => {
   const rid = requestId();
   if (error instanceof z.ZodError) return jsonError('invalid_request', 'Request validation failed', rid, 400);
+  if (error instanceof GitHubApiError) {
+    const headers = new Headers({ 'content-type': error.contentType ?? 'application/json', 'x-request-id': rid });
+    if (error.githubRequestId) headers.set('x-github-request-id', error.githubRequestId);
+    return new Response(error.body, { status: error.status, headers });
+  }
   console.log(JSON.stringify({ code: 'internal_error', request_id: rid, message: error.message }));
   return jsonError('internal_error', 'Internal server error', rid, 500);
 });
@@ -59,6 +65,7 @@ app.post('/github/webhook', async (c) => {
 
 app.post('/v1/github/sync', async (c) => c.json({ repositories: await refreshRepositories(c.env) }));
 app.get('/v1/repositories', async (c) => {
+  await refreshRepositories(c.env);
   const limit = page(c.req.query('limit')); const cursor = decodeCursor(c.req.query('cursor'));
   const rows = await c.env.DB.prepare(`SELECT * FROM repositories ${cursor ? 'WHERE (full_name > ? OR (full_name = ? AND id > ?))' : ''} ORDER BY full_name, id LIMIT ?`)
     .bind(...(cursor ? [cursor.key, cursor.key, cursor.id, limit + 1] : [limit + 1])).all<any>();

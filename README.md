@@ -19,7 +19,7 @@ Every `/v1` request uses `Authorization: Bearer <DESKTOP_API_TOKEN>`. Fetch the 
 
 Typical desktop flow:
 
-1. `POST /v1/github/sync` finds repositories available to the installed GitHub App.
+1. `GET /v1/repositories?limit=100` refreshes and returns repositories available to the installed GitHub App. GitHub REST errors (status and body) are returned unchanged. `POST /v1/github/sync` remains available when only a refresh is needed.
 2. Enable a repository with `PATCH /v1/repositories/:id` and `{ "active": true }`. The scheduled sync imports its open issues.
 3. Poll `GET /v1/issues?state=open` every 10 seconds. Approve a reviewed issue with its returned `version` and a unique `Idempotency-Key`.
 4. Poll queued jobs, atomically claim with `client_id` and a persistent UUID `claim_id`, then heartbeat every 30 seconds.

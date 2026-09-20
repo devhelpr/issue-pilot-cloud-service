@@ -1,4 +1,4 @@
-import { githubAppFetch, githubFetch } from './github';
+import { githubApiError, githubAppFetch, githubFetch } from './github';
 import { issueUpsert } from './db';
 import { allowedAccount } from './security';
 import type { Env } from './types';
@@ -8,7 +8,7 @@ type Repository = { id: number; github_id: string; installation_id: string; owne
 export async function refreshRepositories(env: Env): Promise<number> {
   for (let page = 1; ; page++) {
     const response = await githubAppFetch(env, `/app/installations?per_page=100&page=${page}`);
-    if (!response.ok) throw new Error(`GitHub installations failed (${response.status})`);
+    if (!response.ok) throw await githubApiError(response);
     const discovered = await response.json() as Array<{ id: number; account: { id: number; login: string }; suspended_at: string | null }>;
     for (const installation of discovered) {
       if (!allowedAccount(env, String(installation.account.id)) || installation.suspended_at) continue;
@@ -21,14 +21,17 @@ export async function refreshRepositories(env: Env): Promise<number> {
   const installations = (await env.DB.prepare("SELECT github_id FROM github_installations WHERE status='active'").all<{ github_id: string }>()).results;
   let count = 0;
   for (const installation of installations) {
-    const response = await githubFetch(env, installation.github_id, '/installation/repositories?per_page=100');
-    if (!response.ok) throw new Error(`GitHub repositories failed (${response.status})`);
-    const data = await response.json() as { repositories: any[] };
-    for (const repo of data.repositories) {
-      await env.DB.prepare(`INSERT INTO repositories (github_id, installation_id, owner, name, full_name)
-        VALUES (?, ?, ?, ?, ?) ON CONFLICT(github_id) DO UPDATE SET installation_id=excluded.installation_id, owner=excluded.owner, name=excluded.name, full_name=excluded.full_name, access_status='active', updated_at=CURRENT_TIMESTAMP`)
-        .bind(String(repo.id), installation.github_id, repo.owner.login, repo.name, repo.full_name).run();
-      count++;
+    for (let page = 1; ; page++) {
+      const response = await githubFetch(env, installation.github_id, `/installation/repositories?per_page=100&page=${page}`);
+      if (!response.ok) throw await githubApiError(response);
+      const data = await response.json() as { repositories: any[] };
+      for (const repo of data.repositories) {
+        await env.DB.prepare(`INSERT INTO repositories (github_id, installation_id, owner, name, full_name)
+          VALUES (?, ?, ?, ?, ?) ON CONFLICT(github_id) DO UPDATE SET installation_id=excluded.installation_id, owner=excluded.owner, name=excluded.name, full_name=excluded.full_name, access_status='active', updated_at=CURRENT_TIMESTAMP`)
+          .bind(String(repo.id), installation.github_id, repo.owner.login, repo.name, repo.full_name).run();
+        count++;
+      }
+      if (data.repositories.length < 100) break;
     }
   }
   return count;
