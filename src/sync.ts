@@ -5,6 +5,7 @@ import type { Env } from './types';
 
 type Repository = { id: number; github_id: string; installation_id: string; owner: string; name: string; active: number; sync_cursor: number; sync_updated_after: string | null };
 type Installation = { id: number; account: { id: number; login: string }; suspended_at: string | null };
+type GitHubRepository = { id: number; owner: { login: string }; name: string; full_name: string };
 
 // GitHub returns { installations, total_count } for this endpoint (not a bare array).
 function installationPage(payload: unknown): Installation[] {
@@ -15,36 +16,99 @@ function installationPage(payload: unknown): Installation[] {
   throw new Error('GitHub installations response had an unexpected shape');
 }
 
-export async function refreshRepositories(env: Env): Promise<number> {
+function installationUpsert(env: Env, installation: Installation): D1PreparedStatement {
+  return env.DB.prepare(`INSERT INTO github_installations (github_id, account_id, account_login, status)
+    VALUES (?, ?, ?, 'active')
+    ON CONFLICT(github_id) DO UPDATE SET
+      account_id=excluded.account_id,
+      account_login=excluded.account_login,
+      status='active',
+      updated_at=CURRENT_TIMESTAMP
+    WHERE github_installations.account_id IS NOT excluded.account_id
+       OR github_installations.account_login IS NOT excluded.account_login
+       OR github_installations.status IS NOT 'active'`)
+    .bind(String(installation.id), String(installation.account.id), installation.account.login);
+}
+
+export function repositoryUpsert(env: Env, installationId: string, repo: GitHubRepository): D1PreparedStatement {
+  return env.DB.prepare(`INSERT INTO repositories (github_id, installation_id, owner, name, full_name)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(github_id) DO UPDATE SET
+      installation_id=excluded.installation_id,
+      owner=excluded.owner,
+      name=excluded.name,
+      full_name=excluded.full_name,
+      access_status='active',
+      updated_at=CURRENT_TIMESTAMP
+    WHERE repositories.installation_id IS NOT excluded.installation_id
+       OR repositories.owner IS NOT excluded.owner
+       OR repositories.name IS NOT excluded.name
+       OR repositories.full_name IS NOT excluded.full_name
+       OR repositories.access_status IS NOT 'active'`)
+    .bind(String(repo.id), installationId, repo.owner.login, repo.name, repo.full_name);
+}
+
+/** Discover installations and persist only changed installation metadata. */
+export async function discoverInstallations(env: Env): Promise<number> {
+  let count = 0;
   for (let page = 1; ; page++) {
     const response = await githubAppFetch(env, `/app/installations?per_page=100&page=${page}`);
     if (!response.ok) throw await githubApiError(response);
     const discovered = installationPage(await response.json());
-    for (const installation of discovered) {
-      if (!allowedAccount(env, String(installation.account.id)) || installation.suspended_at) continue;
-      await env.DB.prepare(`INSERT INTO github_installations (github_id, account_id, account_login, status)
-        VALUES (?, ?, ?, 'active') ON CONFLICT(github_id) DO UPDATE SET account_id=excluded.account_id, account_login=excluded.account_login, status='active', updated_at=CURRENT_TIMESTAMP`)
-        .bind(String(installation.id), String(installation.account.id), installation.account.login).run();
-    }
+    const statements = discovered
+      .filter((installation) => allowedAccount(env, String(installation.account.id)) && !installation.suspended_at)
+      .map((installation) => installationUpsert(env, installation));
+    if (statements.length) await env.DB.batch(statements);
+    count += statements.length;
     if (discovered.length < 100) break;
   }
-  const installations = (await env.DB.prepare("SELECT github_id FROM github_installations WHERE status='active'").all<{ github_id: string }>()).results;
+  return count;
+}
+
+/** Ask the scheduler to reconcile repositories. This operation is intentionally cheap and durable. */
+export async function requestRepositoryRefresh(env: Env, installationId?: string): Promise<void> {
+  if (installationId) {
+    await env.DB.prepare("UPDATE github_installations SET repository_sync_requested_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE github_id=? AND status='active' AND repository_sync_requested_at IS NULL").bind(installationId).run();
+    return;
+  }
+  await env.DB.prepare("UPDATE github_installations SET repository_sync_requested_at=CURRENT_TIMESTAMP, updated_at=CURRENT_TIMESTAMP WHERE status='active' AND repository_sync_requested_at IS NULL").run();
+}
+
+/** Reconcile one installation. The caller owns the lease. */
+export async function refreshInstallationRepositories(env: Env, installationId: string): Promise<number> {
+  const installation = await env.DB.prepare("SELECT github_id FROM github_installations WHERE github_id=? AND status='active'").bind(installationId).first<{ github_id: string }>();
+  if (!installation) return 0;
   let count = 0;
-  for (const installation of installations) {
-    for (let page = 1; ; page++) {
-      const response = await githubFetch(env, installation.github_id, `/installation/repositories?per_page=100&page=${page}`);
-      if (!response.ok) throw await githubApiError(response);
-      const data = await response.json() as { repositories: any[] };
-      for (const repo of data.repositories) {
-        await env.DB.prepare(`INSERT INTO repositories (github_id, installation_id, owner, name, full_name)
-          VALUES (?, ?, ?, ?, ?) ON CONFLICT(github_id) DO UPDATE SET installation_id=excluded.installation_id, owner=excluded.owner, name=excluded.name, full_name=excluded.full_name, access_status='active', updated_at=CURRENT_TIMESTAMP`)
-          .bind(String(repo.id), installation.github_id, repo.owner.login, repo.name, repo.full_name).run();
-        count++;
-      }
-      if (data.repositories.length < 100) break;
-    }
+  const seen = new Set<string>();
+  for (let page = 1; ; page++) {
+    const response = await githubFetch(env, installationId, `/installation/repositories?per_page=100&page=${page}`);
+    if (!response.ok) throw await githubApiError(response);
+    const data = await response.json() as { repositories: GitHubRepository[] };
+    data.repositories.forEach((repo) => seen.add(String(repo.id)));
+    if (data.repositories.length) await env.DB.batch(data.repositories.map((repo) => repositoryUpsert(env, installationId, repo)));
+    count += data.repositories.length;
+    if (data.repositories.length < 100) break;
+  }
+  const existing = (await env.DB.prepare('SELECT github_id FROM repositories WHERE installation_id=?').bind(installationId).all<{ github_id: string }>()).results;
+  const stale = existing.map((repo) => repo.github_id).filter((githubId) => !seen.has(githubId));
+  for (let offset = 0; offset < stale.length; offset += 99) {
+    const chunk = stale.slice(offset, offset + 99);
+    const placeholders = chunk.map(() => '?').join(',');
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE repositories SET active=0, access_status='revoked', updated_at=CURRENT_TIMESTAMP
+        WHERE installation_id=? AND github_id IN (${placeholders}) AND (active=1 OR access_status='active')`).bind(installationId, ...chunk),
+      env.DB.prepare(`UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running'
+        AND issue_id IN (SELECT id FROM issues WHERE repository_id IN (SELECT id FROM repositories WHERE installation_id=? AND github_id IN (${placeholders})))`).bind(installationId, ...chunk)
+    ]);
   }
   return count;
+}
+
+/** Manual repair/bootstrap path. Normal desktop reads do not call this. */
+export async function refreshRepositories(env: Env): Promise<number> {
+  await discoverInstallations(env);
+  await requestRepositoryRefresh(env);
+  return (await env.DB.prepare("SELECT COUNT(*) AS count FROM repositories WHERE access_status='active'").first<{ count: number }>())?.count ?? 0;
 }
 
 export async function syncRepository(env: Env, repository: Repository): Promise<{ done: boolean; imported: number }> {
@@ -73,8 +137,38 @@ export async function syncRepository(env: Env, repository: Repository): Promise<
   return { done, imported: issues.filter((issue) => !issue.pull_request).length };
 }
 
+async function runRepositoryDiscovery(env: Env): Promise<void> {
+  const discovery = await env.DB.prepare(`SELECT github_id FROM github_installations
+    WHERE status='active'
+      AND (repository_sync_requested_at IS NOT NULL
+        OR repository_sync_last_synced_at IS NULL
+        OR repository_sync_last_synced_at < datetime('now', '-1 hour'))
+      AND (repository_sync_lease_until IS NULL OR repository_sync_lease_until < CURRENT_TIMESTAMP)
+    ORDER BY repository_sync_requested_at IS NULL, repository_sync_last_synced_at
+    LIMIT 1`).first<{ github_id: string }>();
+  if (!discovery) return;
+
+  const claimed = await env.DB.prepare(`UPDATE github_installations
+    SET repository_sync_lease_until=datetime('now', '+10 minutes')
+    WHERE github_id=? AND status='active'
+      AND (repository_sync_lease_until IS NULL OR repository_sync_lease_until < CURRENT_TIMESTAMP)`).bind(discovery.github_id).run();
+  if (!claimed.meta.changes) return;
+
+  try {
+    await refreshInstallationRepositories(env, discovery.github_id);
+    await env.DB.prepare(`UPDATE github_installations
+      SET repository_sync_requested_at=NULL, repository_sync_last_synced_at=CURRENT_TIMESTAMP,
+          repository_sync_lease_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE github_id=?`).bind(discovery.github_id).run();
+  } catch (error) {
+    await env.DB.prepare("UPDATE github_installations SET repository_sync_lease_until=NULL, updated_at=CURRENT_TIMESTAMP WHERE github_id=?").bind(discovery.github_id).run();
+    throw error;
+  }
+}
+
 export async function runScheduledSync(env: Env): Promise<void> {
   await env.DB.prepare("UPDATE jobs SET status='interrupted', updated_at=CURRENT_TIMESTAMP WHERE status='running' AND heartbeat_at < datetime('now', '-5 minutes')").run();
+  try { await runRepositoryDiscovery(env); }
+  catch (error) { console.log(JSON.stringify({ code: 'repository_discovery_failed', message: error instanceof Error ? error.message : 'unknown' })); }
   const repositories = await env.DB.prepare(`SELECT id, github_id, installation_id, owner, name, active, sync_cursor, sync_updated_after FROM repositories
     WHERE active=1 AND access_status='active' AND (sync_requested_at IS NOT NULL OR last_synced_at IS NULL OR last_synced_at < datetime('now', '-15 minutes')) LIMIT 5`).all<Repository>();
   for (const repository of repositories.results) {

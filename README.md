@@ -19,7 +19,7 @@ Every `/v1` request uses `Authorization: Bearer <DESKTOP_API_TOKEN>`. Fetch the 
 
 Typical desktop flow:
 
-1. `GET /v1/repositories?limit=100` refreshes and returns repositories available to the installed GitHub App. GitHub REST errors (status and body) are returned unchanged. `POST /v1/github/sync` remains available when only a refresh is needed.
+1. `GET /v1/repositories?limit=100` reads repositories known to the service. `POST /v1/github/sync` discovers installations and queues a repository reconciliation, returning `202`; the scheduled Worker performs the GitHub refresh.
 2. Enable a repository with `PATCH /v1/repositories/:id` and `{ "active": true }`. The scheduled sync imports its open issues.
 3. Poll `GET /v1/issues?state=open` every 10 seconds. Approve a reviewed issue with its returned `version` and a unique `Idempotency-Key`.
 4. Poll queued jobs, atomically claim with `client_id` and a persistent UUID `claim_id`, then heartbeat every 30 seconds.
@@ -33,4 +33,4 @@ Run `npm run typecheck` and `npm test`. The test setup uses the Cloudflare Worke
 
 ## Operational notes
 
-The Worker logs identifiers and error codes only. Do not log issue bodies, tokens, private keys or full agent logs. The cron performs bounded repository syncs each minute, starts a normal sync at least every 15 minutes, and marks stale running jobs interrupted.
+The Worker logs identifiers and error codes only. Do not log issue bodies, tokens, private keys or full agent logs. Installation webhooks queue repository discovery, the cron reconciles at most one installation per invocation under a database lease, performs bounded repository issue syncs each minute, and marks stale running jobs interrupted.

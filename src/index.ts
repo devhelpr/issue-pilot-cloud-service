@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { event, id, issueUpsert } from './db';
 import { allowedAccount, isAuthorized, verifyWebhook } from './security';
 import { openapi } from './openapi';
-import { refreshRepositories, runScheduledSync, syncRepository } from './sync';
+import { discoverInstallations, repositoryUpsert, requestRepositoryRefresh, runScheduledSync, syncRepository } from './sync';
 import { GitHubApiError } from './github';
 import type { Env, JobStatus } from './types';
 
@@ -63,9 +63,12 @@ app.post('/github/webhook', async (c) => {
   return c.json({ accepted: true }, 202);
 });
 
-app.post('/v1/github/sync', async (c) => c.json({ repositories: await refreshRepositories(c.env) }));
+app.post('/v1/github/sync', async (c) => {
+  const installations = await discoverInstallations(c.env);
+  await requestRepositoryRefresh(c.env);
+  return c.json({ requested: true, installations }, 202);
+});
 app.get('/v1/repositories', async (c) => {
-  await refreshRepositories(c.env);
   const limit = page(c.req.query('limit')); const cursor = decodeCursor(c.req.query('cursor'));
   const rows = await c.env.DB.prepare(`SELECT * FROM repositories ${cursor ? 'WHERE (full_name > ? OR (full_name = ? AND id > ?))' : ''} ORDER BY full_name, id LIMIT ?`)
     .bind(...(cursor ? [cursor.key, cursor.key, cursor.id, limit + 1] : [limit + 1])).all<any>();
@@ -145,7 +148,11 @@ async function handleInstallation(env: Env, payload: any): Promise<void> {
   const installation = payload.installation; if (!installation) return; const accountId = String(installation.account.id);
   if (!allowedAccount(env, accountId)) return;
   const status = ['deleted', 'suspend'].includes(payload.action) ? (payload.action === 'deleted' ? 'deleted' : 'suspended') : 'active';
-  await env.DB.prepare('INSERT INTO github_installations (github_id,account_id,account_login,status) VALUES (?,?,?,?) ON CONFLICT(github_id) DO UPDATE SET status=excluded.status, account_login=excluded.account_login, updated_at=CURRENT_TIMESTAMP').bind(String(installation.id), accountId, installation.account.login, status).run();
+  await env.DB.prepare(`INSERT INTO github_installations (github_id, account_id, account_login, status) VALUES (?,?,?,?)
+    ON CONFLICT(github_id) DO UPDATE SET account_id=excluded.account_id, account_login=excluded.account_login, status=excluded.status, updated_at=CURRENT_TIMESTAMP
+    WHERE github_installations.account_id IS NOT excluded.account_id
+       OR github_installations.account_login IS NOT excluded.account_login
+       OR github_installations.status IS NOT excluded.status`).bind(String(installation.id), accountId, installation.account.login, status).run();
   if (status !== 'active') {
     const repositories = await env.DB.prepare('SELECT id FROM repositories WHERE installation_id=?').bind(String(installation.id)).all<{ id: number }>();
     await env.DB.batch([env.DB.prepare("UPDATE repositories SET active=0, access_status='revoked', updated_at=CURRENT_TIMESTAMP WHERE installation_id=?").bind(String(installation.id)), ...repositories.results.map((repo) => env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repo.id))]);
@@ -160,6 +167,11 @@ async function handleInstallation(env: Env, payload: any): Promise<void> {
       ...repositories.results.map((repo) => env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE repository_id=?)").bind(repo.id))
     ]);
   }
+  const added = payload.repositories_added ?? [];
+  if (status === 'active' && added.length) {
+    await env.DB.batch(added.map((repo: any) => repositoryUpsert(env, String(installation.id), repo)));
+  }
+  if (status === 'active') await requestRepositoryRefresh(env, String(installation.id));
 }
 async function handleIssue(env: Env, payload: any): Promise<void> {
   if (payload.issue?.pull_request) return; const repo = await env.DB.prepare('SELECT * FROM repositories WHERE github_id=?').bind(String(payload.repository.id)).first<any>(); if (!repo || !repo.active || repo.access_status !== 'active') return;
