@@ -1,13 +1,26 @@
-import { githubFetch } from './github';
+import { githubAppFetch, githubFetch } from './github';
 import { cancelQueuedJobs, upsertIssue } from './db';
+import { allowedAccount } from './security';
 import type { Env } from './types';
 
 type Repository = { id: number; github_id: string; installation_id: string; owner: string; name: string; active: number; sync_cursor: number; sync_updated_after: string | null };
 
 export async function refreshRepositories(env: Env): Promise<number> {
-  const installations = await env.DB.prepare("SELECT github_id FROM github_installations WHERE status='active'").all<{ github_id: string }>();
+  for (let page = 1; ; page++) {
+    const response = await githubAppFetch(env, `/app/installations?per_page=100&page=${page}`);
+    if (!response.ok) throw new Error(`GitHub installations failed (${response.status})`);
+    const discovered = await response.json() as Array<{ id: number; account: { id: number; login: string }; suspended_at: string | null }>;
+    for (const installation of discovered) {
+      if (!allowedAccount(env, String(installation.account.id)) || installation.suspended_at) continue;
+      await env.DB.prepare(`INSERT INTO github_installations (github_id, account_id, account_login, status)
+        VALUES (?, ?, ?, 'active') ON CONFLICT(github_id) DO UPDATE SET account_id=excluded.account_id, account_login=excluded.account_login, status='active', updated_at=CURRENT_TIMESTAMP`)
+        .bind(String(installation.id), String(installation.account.id), installation.account.login).run();
+    }
+    if (discovered.length < 100) break;
+  }
+  const installations = (await env.DB.prepare("SELECT github_id FROM github_installations WHERE status='active'").all<{ github_id: string }>()).results;
   let count = 0;
-  for (const installation of installations.results) {
+  for (const installation of installations) {
     const response = await githubFetch(env, installation.github_id, '/installation/repositories?per_page=100');
     if (!response.ok) throw new Error(`GitHub repositories failed (${response.status})`);
     const data = await response.json() as { repositories: any[] };

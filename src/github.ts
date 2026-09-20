@@ -35,3 +35,7 @@ export async function githubFetch(env: Env, installationId: string, path: string
   const token = await installationToken(env, installationId);
   return fetch(`${GITHUB_API}${path}`, { headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'User-Agent': 'issue-pilot', 'X-GitHub-Api-Version': '2022-11-28' } });
 }
+
+export async function githubAppFetch(env: Env, path: string): Promise<Response> {
+  return fetch(`${GITHUB_API}${path}`, { headers: { Authorization: `Bearer ${await appJwt(env)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'issue-pilot', 'X-GitHub-Api-Version': '2022-11-28' } });
+}
