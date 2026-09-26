@@ -55,6 +55,7 @@ app.post('/github/webhook', async (c) => {
   try {
     if (eventName === 'installation' || eventName === 'installation_repositories') await handleInstallation(c.env, payload);
     if (eventName === 'issues') await handleIssue(c.env, payload);
+    if (eventName === 'issue_comment') await handleIssueComment(c.env, payload);
     await c.env.DB.prepare("UPDATE webhook_deliveries SET outcome='processed', processed_at=CURRENT_TIMESTAMP WHERE delivery_id=?").bind(deliveryId).run();
   } catch (error) {
     await c.env.DB.prepare("UPDATE webhook_deliveries SET outcome='failed', processed_at=CURRENT_TIMESTAMP WHERE delivery_id=?").bind(deliveryId).run();
@@ -101,6 +102,19 @@ app.get('/v1/issues', async (c) => {
   const result = await c.env.DB.prepare(`SELECT i.*, r.full_name, r.active FROM issues i JOIN repositories r ON r.id=i.repository_id WHERE ${clauses.join(' AND ')} ORDER BY i.github_updated_at DESC, i.id DESC LIMIT ?`).bind(...values).all<any>();
   const items = result.results.slice(0, limit); const last = items.at(-1);
   return c.json({ items, next_cursor: result.results.length > limit && last ? encodeCursor({ key: last.github_updated_at, id: last.id }) : null });
+});
+app.get('/v1/issues/:id/comments', async (c) => {
+  const issueId = Number(c.req.param('id'));
+  if (!Number.isSafeInteger(issueId) || issueId <= 0) return jsonError('invalid_issue_id', 'Issue ID must be a positive integer', requestId(), 400);
+  const issue = await c.env.DB.prepare("SELECT i.id FROM issues i JOIN repositories r ON r.id=i.repository_id WHERE i.id=? AND r.active=1 AND r.access_status='active'").bind(issueId).first<{ id: number }>();
+  if (!issue) return jsonError('not_found', 'Active issue not found', requestId(), 404);
+  const limit = page(c.req.query('limit'));
+  const since = c.req.query('since');
+  const rows = await c.env.DB.prepare(`SELECT CAST(github_id AS INTEGER) AS id, author_login, body, html_url, created_at, updated_at
+    FROM issue_comments WHERE issue_id=? AND deleted_at IS NULL ${since ? 'AND updated_at > ?' : ''}
+    ORDER BY updated_at DESC, github_id DESC LIMIT ?`)
+    .bind(...(since ? [issueId, since, limit] : [issueId, limit])).all();
+  return c.json({ items: rows.results });
 });
 app.post('/v1/issues/:id/approve', async (c) => {
   const body = z.object({ version: z.string() }).parse(await c.req.json()); const key = c.req.header('Idempotency-Key');
@@ -181,6 +195,31 @@ async function handleIssue(env: Env, payload: any): Promise<void> {
     env.DB.prepare("UPDATE jobs SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE status='queued' AND issue_id IN (SELECT id FROM issues WHERE github_id=? AND state='closed' AND version=?)").bind(String(payload.issue.id), payload.issue.updated_at),
     env.DB.prepare("UPDATE jobs SET stop_requested=1, updated_at=CURRENT_TIMESTAMP WHERE status='running' AND issue_id IN (SELECT id FROM issues WHERE github_id=? AND state='closed' AND version=?)").bind(String(payload.issue.id), payload.issue.updated_at)
   ] : [])]);
+}
+
+async function handleIssueComment(env: Env, payload: any): Promise<void> {
+  const action = payload.action;
+  if (!['created', 'edited', 'deleted'].includes(action)) return;
+  if (payload.issue?.pull_request) return;
+  const comment = payload.comment;
+  const githubIssueId = payload.issue?.id;
+  const repositoryGithubId = payload.repository?.id;
+  if (!comment?.id || !githubIssueId || !repositoryGithubId) return;
+  const issue = await env.DB.prepare('SELECT i.id FROM issues i JOIN repositories r ON r.id=i.repository_id WHERE i.github_id=? AND r.github_id=?')
+    .bind(String(githubIssueId), String(repositoryGithubId)).first<{ id: number }>();
+  if (!issue) return;
+  if (action === 'deleted') {
+    await env.DB.prepare('UPDATE issue_comments SET body=NULL, updated_at=CURRENT_TIMESTAMP, deleted_at=CURRENT_TIMESTAMP WHERE github_id=? AND issue_id=?')
+      .bind(String(comment.id), issue.id).run();
+    return;
+  }
+  const createdAt = comment.created_at ?? new Date().toISOString();
+  await env.DB.prepare(`INSERT INTO issue_comments (github_id, issue_id, author_login, body, html_url, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(github_id) DO UPDATE SET author_login=excluded.author_login, body=excluded.body,
+      html_url=excluded.html_url, updated_at=excluded.updated_at, deleted_at=NULL
+    WHERE issue_comments.issue_id=excluded.issue_id`)
+    .bind(String(comment.id), issue.id, comment.user?.login ?? 'unknown', comment.body ?? '', comment.html_url ?? '', createdAt, comment.updated_at ?? createdAt).run();
 }
 
 export default { fetch: app.fetch, scheduled: (_controller: ScheduledController, env: Env, ctx: ExecutionContext) => ctx.waitUntil(runScheduledSync(env)) } satisfies ExportedHandler<Env>;
